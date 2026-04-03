@@ -25,6 +25,9 @@ import cv2
 import numpy as np
 import pytesseract
 
+# Set Tesseract data path
+os.environ.setdefault("TESSDATA_PREFIX", "/usr/share/tesseract-ocr/5/tessdata")
+
 
 def read_annotations(annotations_path):
     """Read annotations.txt and group detections by filename.
@@ -36,6 +39,7 @@ def read_annotations(annotations_path):
             if not line:
                 continue
             parts = line.rsplit(" ", 6)
+            
             # Format: filename x1 y1 x2 y2 conf cls_id
             # Filename may contain spaces, so rsplit from right
             filename = parts[0]
@@ -176,17 +180,19 @@ def check_and_split_merged(rects, plate_crop, enhanced):
 def ocr_character(char_img):
     """Run Tesseract OCR on a single character image.
     Returns uppercase character or 'unknown'."""
-    # Resize to a reasonable size for Tesseract
-    resized = cv2.resize(char_img, (40, 60), interpolation=cv2.INTER_LINEAR)
+    # Upscale to a reasonable size for Tesseract with cubic interpolation
+    resized = cv2.resize(char_img, (80, 120), interpolation=cv2.INTER_CUBIC)
 
-    # Add padding around the character
-    padded = cv2.copyMakeBorder(resized, 10, 10, 10, 10,
-                                 cv2.BORDER_CONSTANT, value=255)
+    # Binarize with Otsu's threshold
+    _, binary = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # Invert if needed (Tesseract expects dark text on light background)
-    mean_val = np.mean(padded)
-    if mean_val < 127:
-        padded = cv2.bitwise_not(padded)
+    if np.mean(binary) < 127:
+        binary = cv2.bitwise_not(binary)
+
+    # Add generous padding
+    padded = cv2.copyMakeBorder(binary, 20, 20, 20, 20,
+                                 cv2.BORDER_CONSTANT, value=255)
 
     config = "--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     try:
