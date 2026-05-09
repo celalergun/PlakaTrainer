@@ -1,41 +1,34 @@
 # PlakaTrainer
 
-A small three-step pipeline for building license plate character training data from images.
+![Plate Char Annotator](annotator.png)
 
-The project uses:
-- `kareplaka.onnx` to detect license plates
-- OpenCV contour detection to segment characters from each detected plate
-- Tesseract OCR to place characters into per-symbol folders
-- An OpenCV review tool to correct OCR mistakes with visual plate context
+A pipeline for building Turkish license plate character training data from raw images.
+
+## Pipeline Overview
+
+```
+01_detect_plates.py  →  annotate_chars.py  →  training data (output/)
+     (ONNX)               (Flask web UI)
+```
+
+1. **Detect** — YOLOv8 ONNX model finds plates, crops and deskews them into `deskewed/`
+2. **Annotate** — Flask web annotator auto-segments characters per plate and lets you label each one
+3. **Output** — Per-character labeled crops saved to `output/` ready for CNN training
 
 ## Files
 
-- `01_detect_plates.py`: runs the ONNX detector and writes plate annotations
-- `02_extract_digits.py`: crops plates, finds character blobs, runs OCR, saves characters into `letters/`
-- `03_review_digits.py`: review and reclassify extracted character images
-- `kareplaka.onnx`: trained plate detector
-- `annotations.txt`: detector output
-- `unknown_plates.txt`: images where no plate was found
-- `suspicious.txt`: plates flagged for unusual blob count or merged characters
-- `.review_progress.json`: saved review position for resuming later
+| File | Purpose |
+|---|---|
+| `01_detect_plates.py` | ONNX plate detection, crop + deskew → `deskewed/` |
+| `annotate_chars.py` | Flask web annotator for character labeling |
+| `annotater.py` | Earlier annotation utility |
+| `02_extract_digits.py` | Legacy: Tesseract-based character extraction |
+| `03_review_digits.py` | Legacy: OpenCV review/reclassify tool |
+| `kareplaka.onnx` | Trained YOLOv8 plate detector |
+| `annotations.csv` | Saved character annotations |
+| `debug_seg.py` | Visual pipeline debugger (saves step images to `debug_seg/`) |
 
 ## Requirements
-
-Python packages are listed in `requirements.txt`:
-- `onnxruntime`
-- `opencv-python`
-- `pytesseract`
-- `numpy`
-
-You also need Tesseract OCR installed on the system.
-
-Ubuntu/Debian:
-
-```bash
-sudo apt install tesseract-ocr tesseract-ocr-eng
-```
-
-Python setup example:
 
 ```bash
 python3 -m venv ../venv
@@ -43,153 +36,84 @@ source ../venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Input Data
+Python packages (`requirements.txt`):
+- `onnxruntime`
+- `opencv-python`
+- `flask`
+- `numpy`
 
-Default image directory used by the scripts:
+## Step 1 — Detect & Deskew Plates
 
-```text
-/media/ce/ce_sata/Data/Plaka/plates
-```
-
-You can override this with `--input-dir`.
-
-## Step 1: Detect Plates
-
-Run plate detection with the ONNX model:
+Runs the ONNX detector on a folder of images, crops each detected plate, corrects tilt, and saves to `deskewed/`:
 
 ```bash
-python3 01_detect_plates.py
+python 01_detect_plates.py --input-dir /path/to/images --output-dir .
 ```
 
-Useful options:
+Options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--input-dir` | required | Folder of source images |
+| `--model-path` | `kareplaka.onnx` | ONNX model file |
+| `--output-dir` | `.` | Parent of `deskewed/` output folder |
+| `--confidence-threshold` | `0.25` | Detection confidence cutoff |
+| `--max-angle` | `15.0` | Max deskew correction angle (degrees) |
+
+Output: `deskewed/*.jpg` — one file per detected plate.
+
+## Step 2 — Annotate Characters
+
+Launches a Flask web UI to label characters in each deskewed plate:
 
 ```bash
-python3 01_detect_plates.py --confidence-threshold 0.3 --debug
-python3 01_detect_plates.py --input-dir /path/to/images --model-path kareplaka.onnx --output-dir .
+python annotate_chars.py --input ./deskewed/ --output ./output
 ```
 
-Output:
-- `annotations.txt`
-- `unknown_plates.txt`
+Options:
 
-`annotations.txt` format:
+| Flag | Default | Description |
+|---|---|---|
+| `--input` | `./deskewed` | Folder of deskewed plate images |
+| `--output` | `./output` | Destination for labeled character crops |
+| `--port` | `5000` | HTTP port |
 
-```text
-filename x1 y1 x2 y2 confidence class_id
-```
+Open [http://localhost:5000](http://localhost:5000) in a browser.
 
-## Step 2: Extract Characters
+### Annotator Features
 
-Run character extraction and OCR classification:
+- Auto-segments characters using a histogram + contour pipeline
+- Click & drag on the plate image to add missing bounding boxes
+- Click a box thumbnail to select it, then type the character label
+- `Enter` — save & next plate
+- `←` / `→` — prev / next plate
+- `Del` — remove selected box
+- `n` — skip plate
 
-```bash
-python3 02_extract_digits.py
-```
+### Character Segmentation Pipeline
 
-Useful options:
-
-```bash
-python3 02_extract_digits.py --annotations annotations.txt --input-dir /path/to/images --output-dir .
-```
-
-What it does:
-- reads plate boxes from `annotations.txt`
-- crops each plate
-- enhances contrast with CLAHE
-- finds character contours with adaptive thresholding
-- auto-splits likely merged characters
-- runs Tesseract on each character crop
-- saves each crop into a folder under `letters/`
-
-Output structure:
-
-```text
-letters/
-  A/
-  B/
-  ...
-  0/
-  1/
-  ...
-  unknown/
-suspicious.txt
-```
-
-Notes:
-- `unknown/` contains characters Tesseract could not classify confidently
-- `suspicious.txt` contains plates with blob count outside `6..8` or auto-split merged characters
-- `TESSDATA_PREFIX` is set in the script to `/usr/share/tesseract-ocr/5/tessdata`
-
-## Step 3: Review And Correct Characters
-
-Run the review tool:
-
-```bash
-python3 03_review_digits.py
-```
-
-Useful options:
-
-```bash
-python3 03_review_digits.py --letters-dir letters --annotations annotations.txt --input-dir /path/to/images
-```
-
-The review window shows:
-- the current class folder and image index
-- the original plate crop
-- a rectangle around the current character on the plate
-- all detected character positions with indexes
-- the enlarged character crop
-
-### Review Controls
-
-- `Space` or `Enter`: accept current classification and go to next image
-- `A-Z` or `0-9`: move the current image to that character folder
-- `d`: delete current image
-- `s`: move current image to `letters/review/`
-- `n`: next folder
-- `p`: previous folder
-- `Left Arrow`: previous image
-- `Right Arrow`: next image
-- `q`: quit
-
-### Resume Support
-
-The review tool saves your last position to:
-
-```text
-.review_progress.json
-```
-
-When you start the tool again, it resumes from the saved folder and file if that item still exists.
+1. **Flood-fill inner rect** — heavy Gaussian blur dissolves characters; connected-component analysis with border-touching exclusion isolates the plate body blob
+2. **Binarise crop** — CLAHE + Otsu; polarity determined from the binary itself so dark-frame plates don't confuse it
+3. **Contour pass** — finds individual character blobs; wide merged blobs are histogram-split
+4. **Histogram fallback** — column-sum histogram gap detection at progressively relaxed thresholds
 
 ## Typical Workflow
 
 ```bash
-python3 01_detect_plates.py --confidence-threshold 0.3
-python3 02_extract_digits.py
-python3 03_review_digits.py
+# 1. Detect plates and deskew
+python 01_detect_plates.py --input-dir /media/ce/data/plates --output-dir .
+
+# 2. Annotate characters in the web UI
+python annotate_chars.py --input ./deskewed/ --output ./output
+# → open http://localhost:5000
 ```
 
-## Current Output Artifacts
+## Debugging Segmentation
 
-After a full run, the project may contain:
-- `annotations.txt`
-- `unknown_plates.txt`
-- `suspicious.txt`
-- `letters/` with per-character folders
-- `.review_progress.json`
+`debug_seg.py` runs the full segmentation pipeline on a single image and saves 15 intermediate images to `debug_seg/`:
 
-## Limitations
+```bash
+python debug_seg.py deskewed/03BDT873-20190615-132835.jpg
+```
 
-- OCR quality depends heavily on plate crop quality and character size
-- Tiny or blurry characters often end up in `letters/unknown/`
-- Character segmentation is contour-based, so unusual plate layouts may need manual review
-- Foreign plates and non-standard glyphs may not classify well with the current OCR whitelist
-
-## Tips
-
-- Lower `--confidence-threshold` in step 1 if plates are being missed
-- Review `unknown/` first to improve the dataset fastest
-- Review `suspicious.txt` when segmentation quality looks wrong
-- If you regenerate `letters/`, old review progress may point to a file that no longer exists
+Saved images: `00_original` → `01_gray` → `02_heavy_blur` → `03_thresh_raw` → `04_thresh_polarity` → `05_filled` → `06_inner_contours` → `07_inner_rect_raw` → `08_inner_rect_inset` → `09_crop_gray` → `10_crop_clahe` → `11_binary_crop` → `12_col_histogram` → `13_char_contours` → `14_final_boxes`
