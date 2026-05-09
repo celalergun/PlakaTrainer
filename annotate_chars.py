@@ -95,110 +95,215 @@ def deskew(img: np.ndarray, max_angle: float = 15.0) -> tuple[np.ndarray, float]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Character segmentation
+# Character segmentation — inner-rect crop → contour + histogram
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _is_dark_on_light(gray: np.ndarray) -> bool:
-    """Return True if characters are dark on a light background (e.g. white plate)."""
-    return int(gray.mean()) > 127
+def _find_inner_rect(gray: np.ndarray) -> tuple[int, int, int, int]:
+    """
+    Locate the plate body via a flood-fill-from-outside strategy:
+      1. Strong Gaussian blur dissolves characters into the plate body.
+      2. Otsu threshold — for a white plate the body becomes a bright blob.
+      3. Pad the binary with a 1-px dark border so every exterior region
+         connects to the image edge.
+      4. Label all connected components; discard any whose pixels touch the
+         padded border — those are the outer frame / image background.
+      5. The largest remaining interior blob is the plate body.
+    Falls back to the full image when the plate fills the crop entirely.
+    """
+    ih, iw = gray.shape
+
+    # Strong blur to dissolve characters (sigma ≈ char size / 3)
+    blurred = cv2.GaussianBlur(gray, (0, 0),
+                                sigmaX=max(5, iw // 20),
+                                sigmaY=max(5, ih // 7))
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Tiny close — only to remove single-pixel noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+    best_rect = None
+    best_area = 0
+
+    for polarity in (thresh, 255 - thresh):
+        closed = cv2.morphologyEx(polarity, cv2.MORPH_CLOSE, kernel)
+
+        # Pad with a 1-px dark border so every exterior blob is edge-connected
+        padded = cv2.copyMakeBorder(closed, 1, 1, 1, 1,
+                                     cv2.BORDER_CONSTANT, value=0)
+        ph, pw = padded.shape
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(padded, connectivity=8)
+
+        # Collect labels that touch the padded border → exterior
+        exterior = (set(labels[0, :].tolist())
+                    | set(labels[ph - 1, :].tolist())
+                    | set(labels[:, 0].tolist())
+                    | set(labels[:, pw - 1].tolist()))
+
+        for i in range(1, n):
+            if i in exterior:
+                continue
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if area < iw * ih * 0.10:
+                continue
+            if area > best_area:
+                best_area = area
+                best_rect = (
+                    int(stats[i, cv2.CC_STAT_LEFT]) - 1,   # undo padding offset
+                    int(stats[i, cv2.CC_STAT_TOP]) - 1,
+                    int(stats[i, cv2.CC_STAT_WIDTH]),
+                    int(stats[i, cv2.CC_STAT_HEIGHT]),
+                )
+
+    if best_rect is None:
+        return 0, 0, iw, ih
+
+    rx, ry, rw, rh = best_rect
+    mx = max(2, rw // 20)
+    my = max(2, rh // 12)
+    rx = min(rx + mx, iw - 1)
+    ry = min(ry + my, ih - 1)
+    rw = max(10, rw - 2 * mx)
+    rh = max(10, rh - 2 * my)
+    return rx, ry, rw, rh
 
 
-def _extract_boxes(thresh: np.ndarray, img_h: int, img_w: int) -> list[dict]:
-    """Extract character-like bounding boxes from a binary threshold image."""
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for cnt in contours:
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        aspect = bw / bh if bh > 0 else 0
-        rel_h  = bh / img_h
-        if (0.1 < aspect < 1.2
-                and 0.3 < rel_h < 0.95
-                and bw > 5 and bh > 8):
-            boxes.append({"x": int(x), "y": int(y), "w": int(bw), "h": int(bh), "char": ""})
+def _binarise_crop(gray_crop: np.ndarray) -> np.ndarray:
+    """
+    Binary image of the plate inner crop: character pixels = 255.
+    Polarity determined from the crop itself (chars are dark on a light plate body).
+    """
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    enhanced = clahe.apply(gray_crop)
+    _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Polarity: if majority of the binary is white, background=255 and chars=0 → invert
+    # so that chars=255 (needed for the column histogram to show peaks over ink).
+    binary = (255 - otsu) if otsu.mean() > 127 else otsu
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+
+def _hist_gaps(col_hist: np.ndarray, min_gap: int,
+               threshold_pct: float = 0.08) -> list[tuple[int, int]]:
+    """Inter-character valley gaps from a column histogram."""
+    max_val = col_hist.max() if col_hist.max() > 0 else 1
+    valley = col_hist <= max_val * threshold_pct
+    gaps, in_gap, g_start = [], False, 0
+    for col, is_v in enumerate(valley):
+        if is_v and not in_gap:
+            g_start, in_gap = col, True
+        elif not is_v and in_gap:
+            if col - g_start >= min_gap:
+                gaps.append((g_start, col))
+            in_gap = False
+    if in_gap and len(valley) - g_start >= min_gap:
+        gaps.append((g_start, len(valley)))
+    return gaps
+
+
+def _boxes_from_gaps(gaps: list[tuple[int, int]], total_w: int,
+                     x_off: int, y_off: int, box_h: int) -> list[dict]:
+    starts = [0] + [g[1] for g in gaps]
+    ends   = [g[0] for g in gaps] + [total_w]
+    boxes  = []
+    for xs, xe in zip(starts, ends):
+        bw = xe - xs
+        if bw < 4 or box_h < 4:
+            continue
+        aspect = bw / box_h
+        if 0.08 <= aspect <= 1.8:
+            boxes.append({"x": x_off + xs, "y": y_off, "w": bw, "h": box_h, "char": ""})
     return boxes
 
 
 def segment_chars(img: np.ndarray) -> list[dict]:
     """
-    Returns list of {x, y, w, h} bounding boxes for each character candidate,
-    sorted left-to-right. Handles both dark-on-light and light-on-dark plates
-    by trying multiple thresholding strategies and picking the best result.
+    Character segmentation pipeline:
+      1. Find the plate's inner rectangle (excludes dark border frame).
+      2. Binarise only that crop (chars = 255).
+      3. Contour pass on the crop: find char-sized blobs; split wide ones with histogram.
+      4. Histogram-only fallback at progressively relaxed thresholds if needed.
+    All returned box coordinates are in full-image space.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Upscale if too small
-    img_h, img_w = gray.shape
-    if img_w < 300:
-        scale = 300 / img_w
-        gray  = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-        img_h, img_w = gray.shape
+    ih, iw = gray.shape
+    if iw < 300:
+        scale = 300 / iw
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        ih, iw = gray.shape
 
-    # Denoise slightly
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # ── Step 1: find inner rect ───────────────────────────────────────────────
+    rx, ry, rw, rh = _find_inner_rect(gray)
+    crop_gray = cv2.GaussianBlur(gray[ry: ry + rh, rx: rx + rw], (3, 3), 0)
 
-    dark_on_light = _is_dark_on_light(gray)
+    # ── Step 2: binarise crop ─────────────────────────────────────────────────
+    binary = _binarise_crop(crop_gray)
 
-    candidates = []
+    min_gap  = max(2, rw // 40)
+    col_hist = binary.sum(axis=0).astype(float)
 
-    # Strategy 1: Adaptive threshold, correct polarity for this plate type
-    polarity = cv2.THRESH_BINARY if dark_on_light else cv2.THRESH_BINARY_INV
-    for block in (11, 15, 21):
-        for C in (5, 8, 12):
-            thresh = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, polarity, block, C)
-            candidates.append(_extract_boxes(thresh, img_h, img_w))
+    # ── Step 3: contour pass inside crop ─────────────────────────────────────
+    dil_k   = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    dilated = cv2.dilate(binary, dil_k, iterations=1)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Strategy 2: Otsu global threshold, both polarities
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    candidates.append(_extract_boxes(otsu, img_h, img_w))
-    candidates.append(_extract_boxes(255 - otsu, img_h, img_w))
+    raw = []
+    wide_boxes: list[dict] = []
+    for cnt in contours:
+        bx, by, bw, bh = cv2.boundingRect(cnt)
+        if bw < 4 or bh < 4:
+            continue
+        if bh / rh < 0.25:
+            continue
+        if bw / bh > 4.0 or bw > rw * 0.65:
+            # Wide/full-width merged blob — collect histogram-split candidates
+            # but only use them if individual contours are insufficient
+            if bh / rh >= 0.5:
+                sub_hist = binary[:, bx: bx + bw].sum(axis=0).astype(float)
+                for thr in (0.05, 0.08, 0.12, 0.18, 0.20, 0.22, 0.25):
+                    sub_gaps = _hist_gaps(sub_hist, min_gap, threshold_pct=thr)
+                    sub = _boxes_from_gaps(sub_gaps, bw, rx + bx, ry + by, bh)
+                    if 2 <= len(sub) <= 14:
+                        wide_boxes.extend(sub)
+                        break
+            continue
+        raw.append((bx, by, bw, bh))
+    raw.sort(key=lambda t: t[0])
 
-    # Strategy 3: CLAHE + Otsu (helps uneven lighting)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
-    _, clahe_thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if dark_on_light:
-        candidates.append(_extract_boxes(clahe_thresh, img_h, img_w))
+    single_ws = [bw for _, _, bw, bh in raw if 0.25 <= bw / bh <= 1.1]
+    ref_w = float(np.median(single_ws)) if single_ws else None
+
+    ind_boxes: list[dict] = []
+    for bx, by, bw, bh in raw:
+        char_w = ref_w if ref_w else 0.7 * bh
+        if bw > char_w * 1.6:
+            sub_hist = binary[:, bx: bx + bw].sum(axis=0).astype(float)
+            sub_gaps = _hist_gaps(sub_hist, min_gap)
+            sub = _boxes_from_gaps(sub_gaps, bw, rx + bx, ry + by, bh)
+            if len(sub) >= 2:
+                ind_boxes.extend(sub)
+                continue
+        ind_boxes.append({"x": rx + bx, "y": ry + by, "w": bw, "h": bh, "char": ""})
+
+    # Prefer individual contour boxes; use wide-blob splits only as fallback
+    if 2 <= len(ind_boxes) <= 14:
+        boxes: list[dict] = ind_boxes
+    elif 2 <= len(wide_boxes) <= 14:
+        boxes = wide_boxes
     else:
-        candidates.append(_extract_boxes(255 - clahe_thresh, img_h, img_w))
+        boxes = ind_boxes  # carry forward for histogram fallback below
 
-    # Pick best: most boxes with consistent heights (implausibly many = noise)
-    def score(boxes):
-        n = len(boxes)
-        if n == 0 or n > 14:
-            return -1
-        heights = [b["h"] for b in boxes]
-        std = np.std(heights) if len(heights) > 1 else 0
-        mean_h = np.mean(heights)
-        consistency = 1.0 - min(std / mean_h, 1.0) if mean_h > 0 else 0
-        return n * consistency
+    # ── Step 4: histogram fallback ────────────────────────────────────────────
+    if not (2 <= len(boxes) <= 14):
+        for thr in (0.05, 0.08, 0.12, 0.18, 0.20, 0.22, 0.25):
+            gaps = _hist_gaps(col_hist, min_gap, threshold_pct=thr)
+            fb   = _boxes_from_gaps(gaps, rw, rx, ry, rh)
+            if 2 <= len(fb) <= 14:
+                boxes = fb
+                break
 
-    best = max(candidates, key=score)
-    best.sort(key=lambda b: b["x"])
-    best = merge_close_boxes(best, gap_threshold=img_w // 30)
-    return best
-
-
-def merge_close_boxes(boxes: list[dict], gap_threshold: int = 8) -> list[dict]:
-    """Merge horizontally overlapping or nearly-touching boxes."""
-    if not boxes:
-        return boxes
-    merged = [boxes[0].copy()]
-    for b in boxes[1:]:
-        prev = merged[-1]
-        prev_right = prev["x"] + prev["w"]
-        if b["x"] - prev_right < gap_threshold:
-            # Merge
-            new_x = min(prev["x"], b["x"])
-            new_y = min(prev["y"], b["y"])
-            new_r = max(prev_right, b["x"] + b["w"])
-            new_b = max(prev["y"] + prev["h"], b["y"] + b["h"])
-            prev.update({"x": new_x, "y": new_y, "w": new_r - new_x, "h": new_b - new_y})
-        else:
-            merged.append(b.copy())
-    return merged
+    boxes.sort(key=lambda b: b["x"])
+    return boxes
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -768,3 +873,4 @@ if __name__ == "__main__":
     print(f"  Output → {args.output}/")
     print(f"  Open   → http://localhost:{args.port}\n")
     app.run(port=args.port, debug=False)
+    
