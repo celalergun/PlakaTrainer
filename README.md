@@ -11,7 +11,7 @@ A pipeline for building Turkish license plate character training data from raw i
      (ONNX)               (Flask web UI)
 ```
 
-1. **Detect** — YOLOv8 ONNX model finds plates, crops and deskews them into `deskewed/`
+1. **Detect** — YOLOv26 ONNX model finds plates, crops and deskews them into `deskewed/`
 2. **Annotate** — Flask web annotator auto-segments characters per plate and lets you label each one
 3. **Output** — Per-character labeled crops saved to `output/` ready for CNN training
 
@@ -24,7 +24,7 @@ A pipeline for building Turkish license plate character training data from raw i
 | `annotater.py` | Earlier annotation utility |
 | `02_extract_digits.py` | Legacy: Tesseract-based character extraction |
 | `03_review_digits.py` | Legacy: OpenCV review/reclassify tool |
-| `kareplaka.onnx` | Trained YOLOv8 plate detector |
+| `kareplaka.onnx` | Trained YOLOv26 plate detector |
 | `annotations.csv` | Saved character annotations |
 | `debug_seg.py` | Visual pipeline debugger (saves step images to `debug_seg/`) |
 
